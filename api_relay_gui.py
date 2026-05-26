@@ -6,7 +6,7 @@ import sys
 import tempfile
 import threading
 from http.server import ThreadingHTTPServer
-from tkinter import END, DISABLED, NORMAL, StringVar, Text, Tk, WORD, ttk
+from tkinter import END, DISABLED, NORMAL, StringVar, BooleanVar, Text, Tk, WORD, ttk
 
 try:
     import pystray
@@ -23,6 +23,7 @@ from upstreamkit_core import (
     DEFAULT_DAILY_TOKEN_STATS,
     SSL_TRUST_SOURCE,
     TOKEN_STATS_PATH,
+    PROMPT_LOG_DIR,
     RelayConfig,
     RelayHandler,
     RelayState,
@@ -43,6 +44,10 @@ from upstreamkit_core import (
     add_token_stats,
     now_text,
     get_date_key,
+    get_prompt_log_path,
+    write_prompt_header,
+    write_prompt_response,
+    write_prompt_footer,
     winreg,
 )
 from upstreamkit_dialogs import UpstreamEditDialog
@@ -93,6 +98,7 @@ class RelayApp:
         self.session_models = {}  # 本次会话分模型统计
         self.session_token_var = StringVar()
         self.total_token_var = StringVar()
+        self.log_prompt_var = BooleanVar(value=self.saved_config.get("log_prompt", False))
 
         self.server = None
         self.server_thread = None
@@ -156,6 +162,9 @@ class RelayApp:
 
         self.run_button = ttk.Button(frame, text="运行", command=self.toggle_server)
         self.run_button.grid(row=4, column=3, sticky="e", pady=6)
+
+        self.log_prompt_check = ttk.Checkbutton(frame, text="记录 Prompt 日志", variable=self.log_prompt_var, command=self.on_log_prompt_change)
+        self.log_prompt_check.grid(row=5, column=0, columnspan=2, sticky="w", pady=6)
 
         self.test_button = ttk.Button(frame, text="测试", command=self.test_upstream)
         self.test_button.grid(row=5, column=3, sticky="e", pady=6)
@@ -279,11 +288,20 @@ class RelayApp:
             "upstreams": self.upstreams,
             "active_upstream": self.active_upstream,
             "port": self.port_var.get(),
+            "log_prompt": self.log_prompt_var.get(),
         }
         try:
             save_config_data(data)
         except Exception as exc:
             self.log(f"保存配置失败：{exc}")
+
+    def on_log_prompt_change(self):
+        """Prompt 日志开关变化时，同时更新运行中的服务状态"""
+        self.save_config()
+        if self.server:
+            self.server.state.log_prompt_enabled = self.log_prompt_var.get()
+            status = "已启用" if self.log_prompt_var.get() else "已关闭"
+            self.log(f"Prompt 日志记录 {status}")
 
     def format_token_line(self, stats):
         stats = normalize_token_stats(stats)
@@ -402,6 +420,7 @@ class RelayApp:
             api_key=self.key_var.get().strip(),
             model=self.model_var.get().strip(),
             port=port,
+            log_prompt=self.log_prompt_var.get(),
         )
 
     def test_upstream(self):

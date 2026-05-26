@@ -105,6 +105,7 @@ CONFIG_DIR = app_dir()
 CONFIG_PATH = os.path.join(CONFIG_DIR, "config.json")
 TOKEN_STATS_PATH = os.path.join(CONFIG_DIR, "token_stats.json")
 DAILY_TOKEN_STATS_PATH = os.path.join(CONFIG_DIR, "daily_token_stats.json")
+PROMPT_LOG_DIR = os.path.join(CONFIG_DIR, "prompt_logs")
 SSL_TRUST_SOURCE = configure_ssl_trust()
 DEFAULT_UPSTREAM = {
     "name": "默认上游",
@@ -117,6 +118,7 @@ DEFAULT_CONFIG = {
     "upstreams": [dict(DEFAULT_UPSTREAM)],
     "active_upstream": 0,
     "port": DEFAULT_PORT,
+    "log_prompt": False,
 }
 DEFAULT_TOKEN_STATS = {
     "input_tokens": 0,
@@ -496,6 +498,45 @@ def save_daily_token_stats(data):
         json.dump(normalize_daily_token_stats(data), file, ensure_ascii=False, indent=2)
 
 
+def get_prompt_log_path(request_id):
+    """生成日志文件路径"""
+    os.makedirs(PROMPT_LOG_DIR, exist_ok=True)
+    timestamp = time.strftime("%Y%m%d_%H%M%S")
+    filename = f"prompt_{timestamp}_{request_id}.log"
+    return os.path.join(PROMPT_LOG_DIR, filename)
+
+
+def write_prompt_header(file_path, provider, model, request_body):
+    """写入请求头部和请求体"""
+    header = f"=== provider={provider} model={model} ===\n"
+    request_str = json.dumps(request_body, ensure_ascii=False, indent=2)
+    with open(file_path, "w", encoding="utf-8") as file:
+        file.write(header + "--- Request Body ---\n" + request_str + "\n")
+
+
+def write_prompt_response(file_path, raw_lines, converted_lines=None):
+    """写入响应部分（原始 + 转换后），内存缓冲后一次性写入"""
+    with open(file_path, "a", encoding="utf-8") as file:
+        # 原始响应
+        file.write("--- Response (原始上游 SSE) ---\n")
+        for line in raw_lines:
+            file.write(line.decode("utf-8", errors="replace") if isinstance(line, bytes) else line)
+        # 转换后响应（如果有）
+        if converted_lines:
+            file.write("\n--- Response (转换后客户端 SSE) ---\n")
+            for line in converted_lines:
+                file.write(line.decode("utf-8", errors="replace") if isinstance(line, bytes) else line)
+
+
+def write_prompt_footer(file_path, token_usage):
+    """写入日志尾部"""
+    input_t = token_usage.get("input_tokens", 0)
+    output_t = token_usage.get("output_tokens", 0)
+    footer = f"\n=== End tokens: input={input_t} output={output_t} ===\n"
+    with open(file_path, "a", encoding="utf-8") as file:
+        file.write(footer)
+
+
 def get_date_key():
     return time.strftime("%Y-%m-%d")
 
@@ -567,6 +608,7 @@ class RelayConfig:
     api_key: str
     model: str
     port: int
+    log_prompt: bool = False
 
 
 class RelayState:
@@ -575,6 +617,9 @@ class RelayState:
         self.log = log_func
         self.record_tokens = token_func or (lambda usage: None)
         self.record_detailed_tokens = detailed_token_func or (lambda usage, model: None)
+        self.log_prompt_enabled = getattr(config, 'log_prompt', False) if hasattr(config, 'log_prompt') else False
+        self.prompt_log_paths = {}  # request_id -> file_path 映射
+        self.prompt_log_buffers = {}  # request_id -> {"raw": [], "converted": []} 内存缓冲
 
 
 def normalize_text_content(content):
@@ -773,6 +818,7 @@ class RelayHandler(BaseHTTPRequestHandler):
             length = int(self.headers.get("Content-Length", "0"))
             raw_body = self.rfile.read(length) if length else b"{}"
             body = json.loads(raw_body.decode("utf-8") or "{}")
+            self.original_request_body = body  # 存储原始请求体，供日志使用
             cfg = self.server.state.config
             req_id = f"{int(time.time() * 1000) % 1000000:06d}-{threading.get_ident() % 10000:04d}"
             self.request_id = req_id
@@ -919,6 +965,16 @@ class RelayHandler(BaseHTTPRequestHandler):
             self.send_header("Connection", "close")
             self.end_headers()
             self.server.state.log(f"[{req_id}] 开始向客户端转发流式响应")
+
+            # Prompt 日志：创建文件、写入请求头、初始化缓冲
+            if self.server.state.log_prompt_enabled:
+                file_path = get_prompt_log_path(req_id)
+                self.server.state.prompt_log_paths[req_id] = file_path
+                self.server.state.prompt_log_buffers[req_id] = {"raw": [], "converted": None}  # 直接转发无转换
+                cfg = self.server.state.config
+                write_prompt_header(file_path, cfg.provider, cfg.model, getattr(self, 'original_request_body', {}))
+                self.server.state.log(f"[{req_id}] Prompt 日志文件: {file_path}")
+
             event_name = None
             data_lines = []
             event_counts = {}
@@ -955,6 +1011,9 @@ class RelayHandler(BaseHTTPRequestHandler):
                 data_lines = []
 
             for line in response:
+                # Prompt 日志：累积原始 SSE 行
+                if req_id in self.server.state.prompt_log_buffers:
+                    self.server.state.prompt_log_buffers[req_id]["raw"].append(line)
                 self.wfile.write(line)
                 self.wfile.flush()
                 stripped = line.decode("utf-8", errors="replace").rstrip("\r\n")
@@ -973,6 +1032,13 @@ class RelayHandler(BaseHTTPRequestHandler):
                     f"cache_hit={stream_usage['cache_hit_input_tokens']}, "
                     f"output={stream_usage['output_tokens']}"
                 )
+            # Prompt 日志：写入响应和尾部，清理缓冲
+            if req_id in self.server.state.prompt_log_paths:
+                raw_lines = self.server.state.prompt_log_buffers.get(req_id, {}).get("raw", [])
+                write_prompt_response(self.server.state.prompt_log_paths[req_id], raw_lines)
+                write_prompt_footer(self.server.state.prompt_log_paths[req_id], stream_usage)
+                self.server.state.prompt_log_paths.pop(req_id, None)
+                self.server.state.prompt_log_buffers.pop(req_id, None)
             self.server.state.log(f"[{req_id}] 流式响应转发结束，events={event_counts}")
             self.close_connection = True
             return
@@ -998,8 +1064,17 @@ class RelayHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.server.state.log(f"[{req_id}] 开始将 OpenAI 流式响应转换为 Anthropic SSE")
 
+        # Prompt 日志：创建文件、写入请求头、初始化缓冲
+        if self.server.state.log_prompt_enabled:
+            file_path = get_prompt_log_path(req_id)
+            self.server.state.prompt_log_paths[req_id] = file_path
+            self.server.state.prompt_log_buffers[req_id] = {"raw": [], "converted": []}  # OpenAI 转 Anthropic 有转换
+            cfg = self.server.state.config
+            write_prompt_header(file_path, cfg.provider, model, getattr(self, 'original_request_body', {}))
+            self.server.state.log(f"[{req_id}] Prompt 日志文件: {file_path}")
+
         msg_id = f"msg_{int(time.time() * 1000)}"
-        self.wfile.write(sse_line("message_start", {
+        sse_msg_start = sse_line("message_start", {
             "type": "message_start",
             "message": {
                 "id": msg_id,
@@ -1011,7 +1086,11 @@ class RelayHandler(BaseHTTPRequestHandler):
                 "stop_sequence": None,
                 "usage": {"input_tokens": 0, "output_tokens": 0},
             },
-        }))
+        })
+        self.wfile.write(sse_msg_start)
+        # Prompt 日志：累积转换后的 SSE（message_start）
+        if req_id in self.server.state.prompt_log_buffers:
+            self.server.state.prompt_log_buffers[req_id]["converted"].append(sse_msg_start)
 
         text_index = None
         next_block_index = 0
@@ -1020,6 +1099,9 @@ class RelayHandler(BaseHTTPRequestHandler):
         remote_model = None
 
         for line in response:
+            # Prompt 日志：累积原始 OpenAI SSE 行
+            if req_id in self.server.state.prompt_log_buffers:
+                self.server.state.prompt_log_buffers[req_id]["raw"].append(line)
             if not line.startswith(b"data:"):
                 continue
             payload = line[5:].strip()
@@ -1043,16 +1125,24 @@ class RelayHandler(BaseHTTPRequestHandler):
                 if text_index is None:
                     text_index = next_block_index
                     next_block_index += 1
-                    self.wfile.write(sse_line("content_block_start", {
+                    sse_start = sse_line("content_block_start", {
                         "type": "content_block_start",
                         "index": text_index,
                         "content_block": {"type": "text", "text": ""},
-                    }))
-                self.wfile.write(sse_line("content_block_delta", {
+                    })
+                    self.wfile.write(sse_start)
+                    # Prompt 日志：累积转换后的 SSE
+                    if req_id in self.server.state.prompt_log_buffers:
+                        self.server.state.prompt_log_buffers[req_id]["converted"].append(sse_start)
+                sse_delta = sse_line("content_block_delta", {
                     "type": "content_block_delta",
                     "index": text_index,
                     "delta": {"type": "text_delta", "text": text},
-                }))
+                })
+                self.wfile.write(sse_delta)
+                # Prompt 日志：累积转换后的 SSE
+                if req_id in self.server.state.prompt_log_buffers:
+                    self.server.state.prompt_log_buffers[req_id]["converted"].append(sse_delta)
 
             # 实时处理 tool_calls
             for call in delta.get("tool_calls") or []:
@@ -1072,7 +1162,7 @@ class RelayHandler(BaseHTTPRequestHandler):
                 if tool["name"] and tool["block_index"] is None:
                     tool["block_index"] = next_block_index
                     next_block_index += 1
-                    self.wfile.write(sse_line("content_block_start", {
+                    sse_tool_start = sse_line("content_block_start", {
                         "type": "content_block_start",
                         "index": tool["block_index"],
                         "content_block": {
@@ -1081,16 +1171,23 @@ class RelayHandler(BaseHTTPRequestHandler):
                             "name": tool["name"],
                             "input": {},
                         },
-                    }))
+                    })
+                    self.wfile.write(sse_tool_start)
+                    # Prompt 日志：累积转换后的 SSE
+                    if req_id in self.server.state.prompt_log_buffers:
+                        self.server.state.prompt_log_buffers[req_id]["converted"].append(sse_tool_start)
                     for pending in tool["pending_arguments"]:
-                        self.wfile.write(sse_line("content_block_delta", {
+                        sse_pending = sse_line("content_block_delta", {
                             "type": "content_block_delta",
                             "index": tool["block_index"],
                             "delta": {
                                 "type": "input_json_delta",
                                 "partial_json": pending,
                             },
-                        }))
+                        })
+                        self.wfile.write(sse_pending)
+                        if req_id in self.server.state.prompt_log_buffers:
+                            self.server.state.prompt_log_buffers[req_id]["converted"].append(sse_pending)
                     tool["pending_arguments"] = []
 
                 arguments = fn.get("arguments")
@@ -1098,14 +1195,17 @@ class RelayHandler(BaseHTTPRequestHandler):
                     if tool["block_index"] is None:
                         tool["pending_arguments"].append(arguments)
                     else:
-                        self.wfile.write(sse_line("content_block_delta", {
+                        sse_args = sse_line("content_block_delta", {
                             "type": "content_block_delta",
                             "index": tool["block_index"],
                             "delta": {
                                 "type": "input_json_delta",
                                 "partial_json": arguments,
                             },
-                        }))
+                        })
+                        self.wfile.write(sse_args)
+                        if req_id in self.server.state.prompt_log_buffers:
+                            self.server.state.prompt_log_buffers[req_id]["converted"].append(sse_args)
 
         block_indexes = []
         if text_index is not None:
@@ -1116,15 +1216,24 @@ class RelayHandler(BaseHTTPRequestHandler):
             if tool.get("block_index") is not None
         )
         for block_index in sorted(block_indexes):
-            self.wfile.write(sse_line("content_block_stop", {"type": "content_block_stop", "index": block_index}))
+            sse_stop = sse_line("content_block_stop", {"type": "content_block_stop", "index": block_index})
+            self.wfile.write(sse_stop)
+            if req_id in self.server.state.prompt_log_buffers:
+                self.server.state.prompt_log_buffers[req_id]["converted"].append(sse_stop)
         tool_count = sum(1 for tool in tool_blocks.values() if tool.get("block_index") is not None)
         stop_reason = "tool_use" if tool_count else "end_turn"
-        self.wfile.write(sse_line("message_delta", {
+        sse_delta = sse_line("message_delta", {
             "type": "message_delta",
             "delta": {"stop_reason": stop_reason, "stop_sequence": None},
             "usage": {"output_tokens": 0},
-        }))
-        self.wfile.write(sse_line("message_stop", {"type": "message_stop"}))
+        })
+        self.wfile.write(sse_delta)
+        if req_id in self.server.state.prompt_log_buffers:
+            self.server.state.prompt_log_buffers[req_id]["converted"].append(sse_delta)
+        sse_msg_stop = sse_line("message_stop", {"type": "message_stop"})
+        self.wfile.write(sse_msg_stop)
+        if req_id in self.server.state.prompt_log_buffers:
+            self.server.state.prompt_log_buffers[req_id]["converted"].append(sse_msg_stop)
         if stream_usage["input_tokens"] or stream_usage["output_tokens"]:
             self.server.state.record_tokens(stream_usage)
             self.server.state.record_detailed_tokens(stream_usage, remote_model)
@@ -1133,6 +1242,15 @@ class RelayHandler(BaseHTTPRequestHandler):
                 f"cache_hit={stream_usage['cache_hit_input_tokens']}, "
                 f"output={stream_usage['output_tokens']}"
             )
+        # Prompt 日志：写入响应（原始+转换后）、尾部，清理缓冲
+        if req_id in self.server.state.prompt_log_paths:
+            buffer = self.server.state.prompt_log_buffers.get(req_id, {})
+            raw_lines = buffer.get("raw", [])
+            converted_lines = buffer.get("converted", [])
+            write_prompt_response(self.server.state.prompt_log_paths[req_id], raw_lines, converted_lines)
+            write_prompt_footer(self.server.state.prompt_log_paths[req_id], stream_usage)
+            self.server.state.prompt_log_paths.pop(req_id, None)
+            self.server.state.prompt_log_buffers.pop(req_id, None)
         self.server.state.log(f"[{req_id}] OpenAI 流式转换结束，tool_calls={tool_count}, text_started={text_index is not None}")
         self.close_connection = True
 
